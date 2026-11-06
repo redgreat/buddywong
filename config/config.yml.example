@@ -1,0 +1,40 @@
+# buddywong 配置文件示例
+# 用法：cp config/config.yml.example config/config.yml，然后按需修改。
+# 所有项都可以用环境变量覆盖（见 README「配置」一节），容器部署时优先改环境变量。
+
+# 服务配置
+server:
+  host: 0.0.0.0
+  port: 3002
+  # 数据库、日志目录（容器内固定为 /app/data、/app/logs）
+  data_dir: /app/data
+  log_dir: /app/logs
+  # 反向代理在后时，从 X-Forwarded-For / X-Real-IP 取真实 IP
+  trust_proxy: true
+
+# 安全配置
+security:
+  # ⚠️ 生产环境务必改成随机强密钥！用于签发管理端会话 token。
+  master_key: change_this_master_key_in_production
+  admin_user: admin
+  # 留空：首次启动随机生成管理员密码并打印到容器日志（docker logs buddywong）
+  admin_password: ""
+  session_timeout: 86400   # 会话有效期（秒）
+
+# 反代网关配置
+proxy:
+  request_timeout: 120      # 单次上游请求超时（秒）
+  cool_seconds: 300         # 账号连续失败后的冷却时长（秒）
+  max_account_retries: 3    # 单次请求最多换几个账号重试
+  # 模型别名：下游使用的名字 -> 实际转发给账号的名字
+  # 例：{ "gpt-4o": "claude-sonnet-4", "bw-fast": "deepseek-v3" }
+  model_alias: {}
+  # 出站代理（留空直连），支持 http:// / https:// / socks5://
+  http_proxy: ""
+
+# 自动签到配置
+checkin:
+  enabled: true
+  hour: 8                  # 每日执行时刻（容器本地时区，compose 里设 TZ=Asia/Shanghai）
+  minute: 5
+  log_retention_days: 30   # 调用日志/签到流水保留天数，0 = 永不清理

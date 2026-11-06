@@ -1,0 +1,5 @@
+# buddywong —— 运行时依赖（保持最小，零 Node 构建）
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+PyYAML>=6.0

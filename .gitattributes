@@ -1,0 +1,23 @@
+# 统一换行符：Windows 本地开发、Linux 服务器部署，脚本必须是 LF
+* text=auto
+
+# Linux 上由 bash 直接执行的脚本，CRLF 会导致 bad interpreter
+*.sh         text eol=lf
+Makefile     text eol=lf
+Dockerfile   text eol=lf
+.dockerignore text eol=lf
+
+# 配置与源码统一 LF，避免无意义的 diff
+*.yml        text eol=lf
+*.yaml       text eol=lf
+*.py         text eol=lf
+*.js         text eol=lf
+*.css        text eol=lf
+*.html       text eol=lf
+*.ps1        text eol=lf
+*.md         text eol=lf
+
+# 二进制资源
+*.ico binary
+*.png binary
+*.jpg binary

@@ -1,0 +1,38 @@
+# buddywong —— Linux 服务器 Docker 部署（唯一发布形态）
+#
+# 镜像由 .github/workflows/build-deploy.yml 在推送 v* 标签时构建并推送到阿里云 ACR。
+# 服务器上的更新走 script/redeploy.sh（stop -> rm -> 清理旧镜像 -> pull -> up -d）。
+#
+# 首次部署：
+#   cp config/config.yml.example config/config.yml   # 改 master_key
+#   docker compose pull && docker compose up -d
+#   docker compose logs buddywong | grep 初始管理员密码
+#
+# 端口只绑本机：管理端持有全部账号凭据，公网访问请走 Nginx/Caddy 反代（HTTPS + 访问控制）。
+# 需要直接对外时改成 "3002:3002"，并务必先配好认证与 TLS。
+
+services:
+  buddywong:
+    # 命名空间与镜像名需与 GitHub 仓库 Secrets 中 ALIYUN_NAMESPACE / DOCKER_IMAGE_NAME 一致
+    image: registry.cn-hangzhou.aliyuncs.com/redgreat/buddywong:latest
+    container_name: buddywong
+    hostname: buddywong
+    init: true
+    ports:
+      - "127.0.0.1:3002:3002"
+    environment:
+      - TZ=Asia/Shanghai
+      - CONFIG_PATH=/app/config/config.yml
+      # 可选：固定首启管理员密码；留空则随机生成并打印到日志
+      - BW_ADMIN_PASSWORD=${BW_ADMIN_PASSWORD:-}
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3002/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped

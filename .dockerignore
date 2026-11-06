@@ -1,0 +1,21 @@
+# 排除不需要打进镜像的文件
+.git
+.github
+.gitignore
+.gitattributes
+.dockerignore
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+*.log
+*.md
+data/
+logs/
+config/config.yml
+src/version.txt
+test/
+Makefile
+script/
+docs/

@@ -216,5 +216,15 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Streamlit
+# Streamlit secrets
 .streamlit/secrets.toml
+
+# ============ buddywong 运行数据 ============
+# 含真实密钥的配置、SQLite 数据库、日志都不入库
+config/config.yml
+data/
+logs/
+src/version.txt
+.env
+.venv/
+
