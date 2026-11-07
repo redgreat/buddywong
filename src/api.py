@@ -1,4 +1,4 @@
-"""管理端 REST API：登录、仪表盘、账号、密钥、日志、统计、设置。
+"""管理端 REST API：管理员登录、WorkBuddy 页面扫码登录、仪表盘、账号、密钥、日志、统计、设置。
 
 所有 /api/*（除 /api/login 外）都要求管理端会话 token：
   Authorization: Bearer <token>
@@ -13,7 +13,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import accounts, db
+from . import accounts, db, versions, workbuddy as wb
 from .config import CFG, app_version
 from .security import (auth_token_from_header, generate_api_key, api_key_hash,
                        hash_password, verify_password, verify_token, make_token)
@@ -211,6 +211,92 @@ async def checkin_all(user: str = Depends(current_user)):
             'succeeded': sum(1 for r in results if r.get('ok')), 'items': results}
 
 
+# ── WorkBuddy 页面扫码登录 ──────────────────────────────────────
+# 三个接口全部要求管理端会话；accessToken / refreshToken 只在服务端内存与 SQLite 里，
+# poll 返回给前端的只有 uid / 昵称 / 状态，不会把账号凭据下发到浏览器。
+@router.post('/wb/auth/start')
+async def wb_auth_start(request: Request, user: str = Depends(current_user)):
+    """发起扫码登录，返回 state、授权链接和 PNG 二维码 data URI。"""
+    data = await _body(request)
+    realm = wb.normalize_realm(data.get('realm'))
+    try:
+        out = await wb.start_login(realm)
+    except wb.WorkBuddyError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    out['qr'] = wb.qr_data_uri(out['auth_url'])
+    out['hint'] = ('国内版：微信/QQ 扫码或手机号+验证码登录，成功后自动签到'
+                   if realm == 'cn' else '国际版没有签到体系，扫码只用于纳管账号')
+    return out
+
+
+@router.get('/wb/auth/poll')
+async def wb_auth_poll(state: str = '', realm: str = '', user: str = Depends(current_user)):
+    """前端每 2 秒轮询一次：waiting / ready / expired / invalid / realm_mismatch。"""
+    if not state:
+        return {'status': 'invalid'}
+    try:
+        return await wb.poll_login(state, realm or None)
+    except wb.WorkBuddyError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post('/wb/auth/finish')
+async def wb_auth_finish(request: Request, user: str = Depends(current_user)):
+    """授权成功后落库（同一 uid 重新扫码 = 刷新凭据），并可选立刻签到一次。"""
+    data = await _body(request)
+    state = str(data.get('state') or '').strip()
+    ready = wb.take_ready(state)
+    if ready is None:
+        raise HTTPException(status_code=409, detail='授权尚未完成或已过期，请重新扫码')
+    try:
+        item = accounts.upsert_workbuddy(ready)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # 模型目录是锦上添花：拿不到就保持「不限模型」，绝不因为目录失败让登录失败。
+    try:
+        row = accounts.get_account(int(item['id']))
+        models = await wb.fetch_model_ids(wb.auth_from_row(row), str(row['realm']))
+        if models:
+            accounts.set_models(int(item['id']), models)
+            item['models'] = models
+    except Exception as exc:  # noqa: BLE001
+        logger.info('登录后同步模型目录失败（按不限模型处理）：%s', exc)
+
+    checkin = None
+    auto = (bool(data.get('auto_checkin', True)) and CFG.wb_auto_checkin
+            and bool(item['checkin_supported']))
+    if auto:
+        checkin = await accounts.checkin_account(int(item['id']), 'login')
+    wb.drop_state(state)
+    return {'ok': True, 'item': item, 'checkin': checkin,
+            'message': f"已登录并纳管 {item['name']}"}
+
+
+@router.post('/wb/accounts/{account_id}/refresh')
+async def wb_account_refresh(account_id: int, user: str = Depends(current_user)):
+    """令牌失效时手动刷新授权，并顺带回查实时积分。"""
+    row = accounts.get_account(account_id)
+    if row is None or str(row.get('source')) != 'workbuddy':
+        raise HTTPException(status_code=404, detail='WorkBuddy 账号不存在')
+    return await accounts.refresh_wb_account(account_id)
+
+
+# ── 官方客户端版本（自动跟随，无需写进 config.yml） ─────────────
+@router.get('/wb/versions')
+async def wb_versions(user: str = Depends(current_user)):
+    """当前生效版本、来源、上次/下次同步时间与各探测源结果。"""
+    return versions.status()
+
+
+@router.post('/wb/versions/refresh')
+async def wb_versions_refresh(user: str = Depends(current_user)):
+    """设置页「立即同步」按钮：强制重新向官方发布源取一次版本。"""
+    result = await versions.refresh(force=True)
+    ok = any(item.get('ok') for item in result['sources'].values())
+    return {'ok': ok, **result}
+
+
 # ── API Key ────────────────────────────────────────────────────
 def _json_list(value: Any) -> str:
     if isinstance(value, list):
@@ -365,7 +451,16 @@ _SETTING_RULES: dict[str, tuple[str, int, int]] = {
 @router.get('/settings')
 async def get_settings(user: str = Depends(current_user)):
     return {'items': db.all_settings(), 'config_file': str(CFG.config_path),
-            'http_proxy': CFG.http_proxy or '', 'session_timeout': CFG.session_timeout}
+            'http_proxy': CFG.http_proxy or '', 'session_timeout': CFG.session_timeout,
+            'workbuddy': {
+                'cn_chat_base': CFG.wb_cn_chat_base,
+                'cn_billing_base': CFG.wb_cn_billing_base,
+                'global_base': CFG.wb_global_base,
+                'client_version': versions.client_version('cn'),
+                'versions': versions.status(),
+                'auto_checkin_on_login': CFG.wb_auto_checkin,
+                'state_ttl': CFG.wb_state_ttl,
+            }}
 
 
 @router.put('/settings')

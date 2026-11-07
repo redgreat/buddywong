@@ -50,6 +50,20 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .login-hint { font-size: 12px; color: var(--dim); margin: 4px 0 18px; line-height: 1.6; }
 .login-hint code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 11px; }
 .form-error { color: var(--err); background: var(--err-soft); padding: 8px 10px; border-radius: 6px; font-size: 13px; margin: 0 0 12px; }
+.login-badge { font-size: 11px; font-weight: 600; letter-spacing: 0; color: var(--accent);
+  border: 1px solid var(--accent); border-radius: 20px; padding: 2px 8px; vertical-align: 3px; }
+
+/* WorkBuddy 扫码登录 */
+.qr-box { min-height: 216px; display: grid; place-items: center; margin: 6px 0 12px;
+  background: #fff; border-radius: 10px; border: 1px solid var(--border-soft); padding: 12px; }
+.qr-box img { width: 192px; height: 192px; image-rendering: pixelated; }
+.qr-box .muted { color: #64748b; font-size: 12.5px; text-align: center; }
+.wb-status { font-size: 13px; color: var(--muted); margin: 0 0 10px; min-height: 18px; }
+.wb-status.err { color: var(--err); }
+.wb-status.ok { color: var(--ok); }
+.wb-hint { font-size: 12px; line-height: 1.65; color: var(--dim); margin: 0 0 10px; }
+.wb-link { display: inline-block; font-size: 12.5px; word-break: break-all; }
+.tag.wb { background: rgba(76,141,255,.16); color: #9dc0ff; border: 1px solid rgba(76,141,255,.3); }
 
 /* ── 布局 ───────────────────────────────────────── */
 .app { display: flex; min-height: 100vh; }
@@ -198,6 +212,10 @@ td .sub { display: block; color: var(--dim); font-size: 11px; margin-top: 2px; }
 .info-grid { display: grid; grid-template-columns: 130px 1fr; gap: 8px 14px; font-size: 12.5px; }
 .info-grid dt { color: var(--muted); }
 .info-grid dd { margin: 0; word-break: break-all; }
+.card h3 .tag { margin-left: 6px; vertical-align: 2px; font-weight: 500; }
+.version-bar { display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin: 0 0 14px; flex-wrap: wrap; }
+.version-bar .muted { font-size: 12px; }
 
 /* toast */
 .toast-root { position: fixed; top: 18px; right: 18px; z-index: 100; display: flex;

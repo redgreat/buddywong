@@ -20,7 +20,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import accounts, db
+from . import accounts, db, workbuddy as wb
 from .config import CFG
 from .security import (api_key_hash, client_ip, gateway_key_from_header,
                        ip_allowed, model_allowed)
@@ -32,6 +32,20 @@ router = APIRouter(prefix='/v1', tags=['gateway'])
 # 这些状态说明「这个账号此刻不可用」，换一个号重试才有意义；
 # 400/404 之类是请求本身的问题，换多少账号都一样，直接回给客户端。
 _RETRYABLE = {401, 403, 408, 409, 429}
+
+
+def account_url(account: dict, path: str) -> str:
+    """手工账号走 /v1，WorkBuddy 账号走 /v2（proxy_path 按账号存）。"""
+    prefix = str(account.get('proxy_path') or '/v1').rstrip('/') or '/v1'
+    suffix = path[3:] if path.startswith('/v1/') else path
+    return upstream_url(str(account['base_url']), prefix + suffix)
+
+
+def account_headers(account: dict) -> dict[str, str]:
+    """WorkBuddy 账号需要官方客户端形态的身份头，手工账号只需 Bearer。"""
+    if str(account.get('source')) == 'workbuddy':
+        return wb.chat_headers(account)
+    return auth_headers(str(account['api_key']))
 
 
 class GatewayError(Exception):
@@ -178,10 +192,10 @@ async def _proxy_non_stream(key_row: dict, path: str, body: dict, model: str,
 
     last_error = ''
     for account in candidates:
-        url = upstream_url(str(account['base_url']), path)
+        url = account_url(account, path)
         try:
             async with make_async_client() as client:
-                resp = await client.post(url, headers=auth_headers(str(account['api_key'])), json=body)
+                resp = await client.post(url, headers=account_headers(account), json=body)
         except Exception as exc:  # noqa: BLE001
             last_error = f'{type(exc).__name__}: {exc}'
             accounts.mark_failure(account['id'], last_error)
@@ -249,10 +263,10 @@ async def _proxy_stream(key_row: dict, path: str, body: dict, model: str,
     last_error = ''
     for account in candidates:
         client = make_async_client()
-        url = upstream_url(str(account['base_url']), path)
+        url = account_url(account, path)
         try:
             upstream_req = client.build_request('POST', url,
-                                                headers=auth_headers(str(account['api_key'])), json=body)
+                                                headers=account_headers(account), json=body)
             resp = await client.send(upstream_req, stream=True)
         except Exception as exc:  # noqa: BLE001
             await client.aclose()

@@ -38,3 +38,18 @@ checkin:
   hour: 8                  # 每日执行时刻（容器本地时区，compose 里设 TZ=Asia/Shanghai）
   minute: 5
   log_retention_days: 30   # 调用日志/签到流水保留天数，0 = 永不清理
+
+# WorkBuddy 真实签到协议（页面扫码登录用，端点与官方客户端一致）
+# 只对 source=workbuddy 的账号生效；手工录入的账号仍走上面的通用 HTTP 签到。
+workbuddy:
+  cn_chat_base: https://copilot.tencent.com       # 国内版登录 / 对话 / 模型目录
+  cn_billing_base: https://www.codebuddy.cn      # 国内版签到 / 积分
+  global_base: https://www.workbuddy.ai          # 国际版（无签到体系，仅纳管）
+  # client_version / cli_version 无需配置：默认自动从官方发布源获取并跟随升级
+  #   客户端版本 <- 官网 /v2/update?platform=workbuddy-win32-x64-user
+  #   CLI 版本   <- npm @tencent-ai/codebuddy-code 的 latest
+  # 排查问题要临时钉死时，用环境变量 BW_WB_CLIENT_VERSION / BW_WB_CLI_VERSION，
+  # 或在下面填 client_version / cli_version（填了该项就不再自动更新）。
+  version_refresh_hours: 6                      # 自动同步间隔（小时）
+  auto_checkin_on_login: true                   # 扫码成功后立刻签到一次
+  state_ttl: 900                                # 二维码有效期（秒）

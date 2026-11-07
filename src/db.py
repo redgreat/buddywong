@@ -53,7 +53,17 @@ CREATE TABLE IF NOT EXISTS accounts (
     success_count    INTEGER NOT NULL DEFAULT 0,
     fail_total       INTEGER NOT NULL DEFAULT 0,
     created_at       REAL NOT NULL,
-    updated_at       REAL NOT NULL
+    updated_at       REAL NOT NULL,
+    -- WorkBuddy 扫码登录账号（source=workbuddy）专用；手工账号这些列保持默认值
+    source           TEXT NOT NULL DEFAULT 'custom',
+    realm            TEXT NOT NULL DEFAULT 'cn',
+    wb_uid           TEXT NOT NULL DEFAULT '',
+    wb_refresh_token TEXT NOT NULL DEFAULT '',
+    wb_domain        TEXT NOT NULL DEFAULT '',
+    wb_enterprise_id TEXT NOT NULL DEFAULT '',
+    wb_nickname      TEXT NOT NULL DEFAULT '',
+    wb_expires_at    REAL NOT NULL DEFAULT 0,
+    proxy_path       TEXT NOT NULL DEFAULT '/v1'
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -98,6 +108,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_ts        ON request_logs(ts);
 CREATE INDEX IF NOT EXISTS idx_logs_day       ON request_logs(day);
 CREATE INDEX IF NOT EXISTS idx_logs_key       ON request_logs(key_id, ts);
 CREATE INDEX IF NOT EXISTS idx_logs_account   ON request_logs(account_id, ts);
+-- 注意：wb_uid 唯一索引不能放在这里！旧库此时还没有这一列，executescript 会直接报
+-- "no such column: wb_uid"。统一放到 _migrate() 在补列之后再建。
 
 CREATE TABLE IF NOT EXISTS checkin_logs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,6 +128,31 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 """
+
+# 旧库升级：SQLite 的 CREATE TABLE IF NOT EXISTS 不会补新列，必须显式 ALTER。
+# 每条都是 (列名, 完整列定义)，只在缺失时添加，重复启动安全。
+_ACCOUNT_MIGRATIONS: list[tuple[str, str]] = [
+    ('source',           "TEXT NOT NULL DEFAULT 'custom'"),
+    ('realm',            "TEXT NOT NULL DEFAULT 'cn'"),
+    ('wb_uid',           "TEXT NOT NULL DEFAULT ''"),
+    ('wb_refresh_token', "TEXT NOT NULL DEFAULT ''"),
+    ('wb_domain',        "TEXT NOT NULL DEFAULT ''"),
+    ('wb_enterprise_id', "TEXT NOT NULL DEFAULT ''"),
+    ('wb_nickname',      "TEXT NOT NULL DEFAULT ''"),
+    ('wb_expires_at',    'REAL NOT NULL DEFAULT 0'),
+    ('proxy_path',       "TEXT NOT NULL DEFAULT '/v1'"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {row['name'] for row in conn.execute('PRAGMA table_info(accounts)')}
+    for column, ddl in _ACCOUNT_MIGRATIONS:
+        if column not in existing:
+            conn.execute(f'ALTER TABLE accounts ADD COLUMN {column} {ddl}')
+            logger.info('数据库升级：accounts 新增列 %s', column)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_wb_uid "
+                 "ON accounts(wb_uid) WHERE wb_uid <> ''")
+
 
 # 可在「设置」页热改的项，启动时用 config.yml / 环境变量的值播种（不覆盖已有值）
 _SEED: dict[str, Any] = {
@@ -148,6 +185,7 @@ def connect() -> sqlite3.Connection:
         conn.execute('PRAGMA synchronous=NORMAL')
         conn.execute('PRAGMA foreign_keys=ON')
         conn.executescript(SCHEMA)
+        _migrate(conn)
         _conn = conn
         for key, value in _SEED.items():
             conn.execute('INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)',

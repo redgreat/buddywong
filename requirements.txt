@@ -3,3 +3,5 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 httpx>=0.27.0
 PyYAML>=6.0
+# 纯 Python 二维码生成（扫码登录，无 Pillow / 无 CDN）
+segno>=1.6.1

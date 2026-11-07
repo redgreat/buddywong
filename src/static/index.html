@@ -24,8 +24,8 @@
 <div id="login-view" class="login-wrap">
   <form id="login-form" class="login-card" autocomplete="on">
     <div class="login-logo">BW</div>
-    <h1>buddywong</h1>
-    <p class="login-sub">自动签到 · 账号池反代 · 可视化控制台</p>
+    <h1>buddywong <small class="login-badge">管理员登录</small></h1>
+    <p class="login-sub">WorkBuddy 签到 · 账号池反代 · 可视化控制台</p>
     <label class="field">
       <span>管理员账号</span>
       <input id="login-user" name="username" autocomplete="username" value="admin" required>
@@ -34,7 +34,11 @@
       <span>密码</span>
       <input id="login-pass" name="password" type="password" autocomplete="current-password" required>
     </label>
-    <p class="login-hint">首次启动的初始密码打印在容器日志里：<code>docker logs buddywong</code></p>
+    <p class="login-hint">首次启动密码（二选一）：<br>
+      ① <code>docker compose logs buddywong | grep -A6 初始管理员</code><br>
+      ② 在 compose 里设 <code>BW_ADMIN_PASSWORD</code> 固定密码<br>
+      登录后在「设置 → 修改管理密码」改掉。</p>
+    <p class="login-hint">进入后台后，到「账号管理 → 扫码登录 WorkBuddy」在页面上直接授权账号并自动签到。</p>
     <p id="login-error" class="form-error hidden"></p>
     <button class="btn primary block" type="submit">登 录</button>
   </form>

@@ -60,6 +60,7 @@ class Config:
         security = _yaml_section(raw, 'security')
         proxy = _yaml_section(raw, 'proxy')
         checkin = _yaml_section(raw, 'checkin')
+        workbuddy = _yaml_section(raw, 'workbuddy')
 
         # ── 服务 ──────────────────────────────────────────────
         self.host: str = env_str('BW_HOST', str(server.get('host', '0.0.0.0')))
@@ -87,6 +88,29 @@ class Config:
         self.checkin_hour: int = env_int('BW_CHECKIN_HOUR', int(checkin.get('hour', 8)))
         self.checkin_minute: int = env_int('BW_CHECKIN_MINUTE', int(checkin.get('minute', 5)))
         self.log_retention_days: int = env_int('BW_LOG_RETENTION_DAYS', int(checkin.get('log_retention_days', 30)))
+
+        # ── WorkBuddy 真实签到协议 ─────────────────────────────
+        # 端点与 UA 对齐官方客户端；域名变化时可用环境变量覆盖，不必改代码。
+        self.wb_cn_chat_base: str = env_str('BW_WB_CHAT_BASE',
+                                            str(workbuddy.get('cn_chat_base', 'https://copilot.tencent.com'))).rstrip('/')
+        self.wb_cn_billing_base: str = env_str('BW_WB_BILLING_BASE',
+                                               str(workbuddy.get('cn_billing_base', 'https://www.codebuddy.cn'))).rstrip('/')
+        self.wb_global_base: str = env_str('BW_WB_GLOBAL_BASE',
+                                           str(workbuddy.get('global_base', 'https://www.workbuddy.ai'))).rstrip('/')
+        # 客户端版本默认**自动跟随官方发布源**（见 versions.py），这里留空即自动。
+        # 只有排查问题需要临时钉死时才填；填了该项就不再自动更新。
+        self.wb_client_version: str = env_str('BW_WB_CLIENT_VERSION',
+                                              str(workbuddy.get('client_version', '') or '')).strip()
+        self.wb_cli_version: str = env_str('BW_WB_CLI_VERSION',
+                                           str(workbuddy.get('cli_version', '') or '')).strip()
+        self.wb_version_refresh_hours: int = max(1, env_int(
+            'BW_WB_VERSION_REFRESH_HOURS', int(workbuddy.get('version_refresh_hours', 6))))
+        registries = workbuddy.get('cli_registry_urls')
+        self.wb_cli_registry_urls: list[str] = (
+            [str(u).strip() for u in registries if str(u).strip().startswith('https://')]
+            if isinstance(registries, list) else [])
+        self.wb_auto_checkin: bool = env_bool('BW_WB_AUTO_CHECKIN', bool(workbuddy.get('auto_checkin_on_login', True)))
+        self.wb_state_ttl: int = max(60, env_int('BW_WB_STATE_TTL', int(workbuddy.get('state_ttl', 900))))
 
     # ── 内部 ──────────────────────────────────────────────────
     @staticmethod

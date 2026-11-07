@@ -1,4 +1,4 @@
-"""后台调度线程：每日自动签到、冷却到期恢复、历史日志清理。
+"""后台调度线程：每日自动签到、官方客户端版本同步、冷却到期恢复、历史日志清理。
 
 不用 APScheduler / celery —— 一个 daemon 线程每 20 秒 tick 一次就够，
 容器里少一个依赖、少一个进程。所有「今天是否已经跑过」的状态存在 settings 表里，
@@ -12,7 +12,7 @@ import threading
 import time
 from typing import Any
 
-from . import accounts, db
+from . import accounts, db, versions
 from .config import CFG
 
 logger = logging.getLogger('buddywong.scheduler')
@@ -48,7 +48,15 @@ def _tick() -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.error('每日自动签到异常：%s', exc)
 
-    # 3) 日志清理（每 6 小时一次）
+    # 3) 官方客户端版本同步：启动后第一个 tick 就拉一次，之后按 TTL 自动跟随升级。
+    #    TTL 未到时这里只做一次时间比较，不创建事件循环、不发网络请求。
+    try:
+        if now >= versions.status()['next_refresh_at']:
+            asyncio.run(versions.refresh_if_stale())
+    except Exception as exc:  # noqa: BLE001 — 版本探测失败绝不阻断签到主流程
+        logger.warning('官方客户端版本同步失败（沿用上次值）：%s', exc)
+
+    # 4) 日志清理（每 6 小时一次）
     last_cleanup = db.setting_float('logs_cleanup_last_ts', 0)
     if now - last_cleanup >= _CLEANUP_INTERVAL:
         db.set_setting('logs_cleanup_last_ts', now)

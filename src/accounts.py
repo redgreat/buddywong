@@ -1,6 +1,9 @@
 """账号管理：CRUD、加权轮询选号、连通性探测、手动/自动签到、状态与冷却。
 
-一个「账号」= 一组上游 OpenAI 兼容端点凭据（base_url + api_key）+ 可选签到配置。
+两类账号：
+  * custom    —— 手工录入的 OpenAI 兼容端点（base_url + api_key）+ 通用 HTTP 签到钩子
+  * workbuddy —— 页面扫码登录拿到的腾讯账号，凭据自动维护，走 workbuddy.py 的真实协议签到
+
 buddywong 不依赖任何外部网关：反代时直接从这里的账号池里挑一个转发请求。
 """
 from __future__ import annotations
@@ -15,7 +18,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import db
+from . import db, workbuddy as wb
 from .config import CFG
 from .security import model_allowed
 from .upstream import auth_headers, make_async_client, upstream_url
@@ -30,6 +33,8 @@ _ACCOUNT_FIELDS = (
     'status', 'credits', 'expires_at', 'checkin_url', 'checkin_method', 'checkin_headers',
     'checkin_body', 'last_checkin_at', 'last_probe_at', 'last_error', 'fail_count',
     'cool_until', 'success_count', 'fail_total', 'created_at', 'updated_at',
+    'source', 'realm', 'wb_uid', 'wb_refresh_token', 'wb_domain', 'wb_enterprise_id',
+    'wb_nickname', 'wb_expires_at', 'proxy_path',
 )
 
 
@@ -89,12 +94,15 @@ def effective_status(row: dict, now: float | None = None) -> str:
 
 
 def public(row: dict) -> dict:
-    """对外输出：绝不返回明文 api_key（管理端也不需要回显）。"""
+    """对外输出：绝不返回明文 api_key / refreshToken（管理端也不需要回显）。"""
     item = {key: row.get(key) for key in _ACCOUNT_FIELDS}
     item['api_key_masked'] = _mask(str(item.pop('api_key') or ''))
+    item['wb_refresh_configured'] = bool(item.pop('wb_refresh_token', ''))
     item['models'] = _as_list(item['models'])
     item['checkin_headers'] = _as_dict(item['checkin_headers'])
     item['checkin_body'] = _as_dict(item['checkin_body'])
+    item['checkin_supported'] = (item.get('source') != 'workbuddy' or
+                                 wb.supports_checkin(item.get('realm'), item.get('wb_enterprise_id')))
     item['effective_status'] = effective_status(row)
     item['cool_remaining'] = max(0, int(float(item.get('cool_until') or 0) - time.time()))
     return item
@@ -221,6 +229,92 @@ def set_enabled(account_id: int, enabled: bool) -> dict | None:
     return public(row) if row else None
 
 
+# ── WorkBuddy 扫码登录账号 ───────────────────────────────────────
+def upsert_workbuddy(ready: dict) -> dict:
+    """把扫码授权结果落库；同一 uid 再次扫码 = 刷新凭据，不产生重复账号。"""
+    uid = str(ready.get('uid') or '').strip()
+    token = str(ready.get('access_token') or '').strip()
+    if not uid or not token:
+        raise ValueError('授权结果缺少 uid / accessToken，请重新扫码')
+    realm = wb.normalize_realm(ready.get('realm'))
+    existing = db.query_one("SELECT * FROM accounts WHERE source = 'workbuddy' AND wb_uid = ?", (uid,))
+    now = time.time()
+    name = str(ready.get('nickname') or '').strip() or f'WorkBuddy {uid[:8]}'
+    values = {
+        'name': name,
+        'group_name': str(existing['group_name']) if existing else 'workbuddy',
+        'base_url': wb.chat_base(realm),
+        'api_key': token,
+        'enabled': 1,
+        'credits': float(existing['credits']) if existing else 0.0,
+        'source': 'workbuddy',
+        'realm': realm,
+        'wb_uid': uid,
+        'wb_refresh_token': str(ready.get('refresh_token') or ''),
+        'wb_domain': str(ready.get('domain') or ''),
+        'wb_enterprise_id': str(ready.get('enterprise_id') or ''),
+        'wb_nickname': name,
+        'wb_expires_at': float(ready.get('expires_at') or 0),
+        'proxy_path': '/v2',          # WorkBuddy 对话端点在 /v2/chat/completions
+        'status': 'healthy',
+        'last_error': '',
+        'fail_count': 0,
+        'cool_until': 0,
+        'updated_at': now,
+    }
+    if existing:
+        assignments = ', '.join(f'{key} = ?' for key in values)
+        db.execute(f'UPDATE accounts SET {assignments} WHERE id = ?',
+                   tuple(values.values()) + (existing['id'],))
+        account_id = int(existing['id'])
+        logger.info('WorkBuddy 账号重新授权：%s（uid=%s）', name, uid)
+    else:
+        values.update({'models': '[]', 'weight': 1, 'expires_at': '',
+                       'checkin_url': '', 'checkin_method': 'POST',
+                       'checkin_headers': '{}', 'checkin_body': '{}', 'created_at': now})
+        columns = ', '.join(values)
+        placeholders = ', '.join('?' for _ in values)
+        account_id = db.execute(f'INSERT INTO accounts ({columns}) VALUES ({placeholders})',
+                                tuple(values.values()))
+        logger.info('WorkBuddy 账号已纳管：%s（uid=%s, realm=%s）', name, uid, realm)
+    return public(get_account(account_id))
+
+
+def set_models(account_id: int, models: list[str]) -> dict | None:
+    db.execute('UPDATE accounts SET models = ?, updated_at = ? WHERE id = ?',
+               (json.dumps([str(m) for m in models if str(m).strip()], ensure_ascii=False),
+                time.time(), account_id))
+    row = get_account(account_id)
+    return public(row) if row else None
+
+
+def _apply_refresh(account_id: int, fields: dict) -> None:
+    db.execute('UPDATE accounts SET api_key = ?, wb_refresh_token = ?, wb_expires_at = ?, '
+               'wb_domain = ?, status = ?, last_error = "", updated_at = ? WHERE id = ?',
+               (str(fields.get('access_token') or ''), str(fields.get('refresh_token') or ''),
+                float(fields.get('expires_at') or 0), str(fields.get('domain') or ''),
+                'healthy', time.time(), account_id))
+
+
+async def refresh_wb_account(account_id: int) -> dict:
+    """刷新 accessToken 并顺带查实时积分；页面「刷新授权」按钮走这里。"""
+    row = get_account(account_id)
+    if row is None or str(row.get('source')) != 'workbuddy':
+        return {'ok': False, 'message': '不是 WorkBuddy 账号'}
+    auth = wb.auth_from_row(row)
+    ok, message, fields = await wb.refresh_token(auth, auth['realm'])
+    if ok:
+        _apply_refresh(account_id, fields)
+        auth.update(fields)
+    fresh = get_account(account_id)
+    cok, credits, cmsg = await wb.fetch_credits(wb.auth_from_row(fresh), str(fresh['realm']))
+    if cok and credits is not None:
+        db.execute('UPDATE accounts SET credits = ?, updated_at = ? WHERE id = ?',
+                   (credits, time.time(), account_id))
+    return {'ok': ok, 'message': message, 'credits': credits if cok else None,
+            'credits_message': cmsg, 'item': public(get_account(account_id))}
+
+
 # ── 轮询选号 ───────────────────────────────────────────────────
 def select_candidates(model: str = '', limit: int | None = None) -> list[dict]:
     """按权重轮转返回可用账号（有序，第一个优先，失败后依次换下一个）。"""
@@ -274,6 +368,21 @@ async def probe_account(account_id: int) -> dict:
     row = get_account(account_id)
     if row is None:
         return {'ok': False, 'message': '账号不存在'}
+    if str(row.get('source')) == 'workbuddy':
+        # 腾讯账号没有 /v1/models：探测 = 拉官方模型目录，顺手刷新可用模型
+        try:
+            models = await wb.fetch_model_ids(wb.auth_from_row(row), str(row['realm']))
+        except Exception as exc:  # noqa: BLE001
+            models = []
+            logger.warning('WorkBuddy 模型目录探测失败：%s', exc)
+        result = {'ok': bool(models), 'status_code': 200 if models else 0, 'models': models,
+                  'message': f'连通正常，同步到 {len(models)} 个模型' if models else '未取到模型目录，请检查令牌或网络'}
+        if models:
+            set_models(account_id, models)
+        db.execute('UPDATE accounts SET last_probe_at = ?, status = ?, last_error = ?, updated_at = ? WHERE id = ?',
+                   (time.time(), 'healthy' if models else 'error',
+                    '' if models else result['message'], time.time(), account_id))
+        return result
     url = upstream_url(str(row['base_url']), '/v1/models')
     result: dict[str, Any] = {'ok': False, 'status_code': 0, 'models': [], 'message': ''}
     try:
@@ -319,11 +428,76 @@ def _extract_credits(payload: Any) -> float | None:
     return None
 
 
+async def _checkin_workbuddy(row: dict, trigger: str) -> dict:
+    """真实 WorkBuddy 签到：令牌保鲜 -> daily-checkin -> 查实时积分 -> 落库。"""
+    account_id = int(row['id'])
+    auth = wb.auth_from_row(row)
+    realm = auth['realm']
+    now = time.time()
+    result: dict[str, Any] = {'ok': False, 'skipped': False, 'status_code': 0,
+                              'message': '', 'credits': None,
+                              'account_id': account_id, 'account_name': str(row['name'])}
+    log_trigger = trigger
+
+    if not wb.supports_checkin(realm, auth.get('enterprise_id')):
+        result['skipped'] = True
+        result['status_code'] = -2
+        result['message'] = '国际版 / 企业账号没有个人签到体系，已跳过'
+        log_trigger = 'skip'
+        db.execute('UPDATE accounts SET updated_at = ? WHERE id = ?', (now, account_id))
+    else:
+        # 签到用的是 accessToken；临近过期先用 refreshToken 换新的，否则签到必失败。
+        expires = float(row.get('wb_expires_at') or 0)
+        if expires and expires - now < 600 and auth['refresh_token']:
+            refreshed, message, fields = await wb.refresh_token(auth, realm)
+            if refreshed:
+                _apply_refresh(account_id, fields)
+                auth.update(fields)
+            else:
+                logger.warning('账号 %s 签到前刷新令牌失败：%s（仍尝试签到）',
+                               row['name'], message)
+
+        code, message = await wb.checkin(auth, realm)
+        result['status_code'] = int(code)
+        result['ok'] = code in (0, 10001)
+        result['message'] = message + ('（可稍后重试）' if code == -3 else '')
+        if result['ok']:
+            credits_ok, credits, credits_msg = await wb.fetch_credits(auth, realm)
+            if credits_ok and credits is not None:
+                result['credits'] = credits
+            else:
+                logger.info('账号 %s 积分回查未成功：%s', row['name'], credits_msg)
+
+        if result['ok']:
+            if result['credits'] is None:
+                db.execute('UPDATE accounts SET last_checkin_at = ?, status = ?, last_error = "", '
+                           'fail_count = 0, updated_at = ? WHERE id = ?',
+                           (now, 'healthy', now, account_id))
+            else:
+                db.execute('UPDATE accounts SET last_checkin_at = ?, credits = ?, status = ?, '
+                           'last_error = "", fail_count = 0, updated_at = ? WHERE id = ?',
+                           (now, result['credits'], 'healthy', now, account_id))
+        else:
+            db.execute('UPDATE accounts SET last_checkin_at = ?, status = ?, last_error = ?, '
+                       'updated_at = ? WHERE id = ?',
+                       (now, 'error', result['message'][:500], now, account_id))
+
+    db.execute(
+        'INSERT INTO checkin_logs(ts, account_id, account_name, ok, status_code, message, trigger) '
+        'VALUES(?, ?, ?, ?, ?, ?, ?)',
+        (now, account_id, row['name'], 1 if result['ok'] else 0,
+         result['status_code'], result['message'][:500], log_trigger),
+    )
+    return result
+
+
 async def checkin_account(account_id: int, trigger: str = 'manual') -> dict:
-    """执行一次签到；结果写入 checkin_logs 并回写账号状态。"""
+    """执行一次签到；WorkBuddy 账号走真实协议，手工账号走通用 HTTP 钩子。"""
     row = get_account(account_id)
     if row is None:
         return {'ok': False, 'message': '账号不存在'}
+    if str(row.get('source')) == 'workbuddy':
+        return await _checkin_workbuddy(row, trigger)
     url = str(row['checkin_url'] or '').strip()
     if not url:
         return {'ok': False, 'skipped': True, 'message': '未配置签到地址'}
@@ -377,7 +551,9 @@ async def checkin_account(account_id: int, trigger: str = 'manual') -> dict:
 
 
 async def checkin_all(trigger: str = 'auto') -> list[dict]:
-    rows = db.query("SELECT id FROM accounts WHERE enabled = 1 AND checkin_url <> '' ORDER BY id")
+    rows = db.query(
+        "SELECT id FROM accounts WHERE enabled = 1 AND (checkin_url <> '' "
+        "OR (source = 'workbuddy' AND realm <> 'global' AND wb_enterprise_id = '')) ORDER BY id")
     results = []
     for row in rows:
         results.append(await checkin_account(row['id'], trigger))

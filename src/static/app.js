@@ -4,7 +4,7 @@
 const TOKEN_KEY = 'buddywong_token';
 const PAGE_META = {
   dashboard: ['仪表盘', '账号池健康度与近 24 小时调用概览'],
-  accounts:  ['账号管理', '纳管上游账号、自动签到与连通性探测'],
+  accounts:  ['账号管理', 'WorkBuddy 扫码登录、自动签到与连通性探测'],
   keys:      ['密钥分发', '为下游客户端签发独立 API Key'],
   logs:      ['调用日志', '每一笔反代请求的模型、状态、延迟与用量'],
   checkins:  ['签到流水', '每日自动签到与手动签到的执行结果'],
@@ -20,6 +20,9 @@ const state = {
   page: 'dashboard',
   version: '-',
   logs: { limit: 50, offset: 0, model: '', status: '' },
+  wb: null,          // 当前扫码会话（不含任何 token）
+  wbPoll: null,      // 轮询定时器
+  wbErrors: 0,
 };
 
 const pageEl = document.getElementById('page');
@@ -90,10 +93,110 @@ function showApp() {
   document.getElementById('side-version').textContent = state.version;
 }
 function doLogout() {
+  clearWbPoll();
+  state.wb = null;
   state.token = '';
   localStorage.removeItem(TOKEN_KEY);
   showLogin();
   pageEl.innerHTML = '';
+}
+
+/* ── WorkBuddy 页面扫码登录 ────────────────────────────────────
+   管理后台登录（上面的账密表单）与 WorkBuddy 账号授权是两层：
+   先进后台，再在「账号管理」里扫码把腾讯账号纳管进来并自动签到。
+   二维码由服务端生成 PNG data URI，凭据全程不经过浏览器。            */
+function clearWbPoll() {
+  if (state.wbPoll) { clearInterval(state.wbPoll); state.wbPoll = null; }
+}
+function setWbStatus(text, kind) {
+  const el = document.getElementById('wb-status');
+  if (el) { el.textContent = text; el.className = 'wb-status' + (kind ? ' ' + kind : ''); }
+}
+function wbLoginModal() {
+  openModal('扫码登录 WorkBuddy 账号',
+    '<div class="wb-login">' +
+      '<label class="field"><span>账号版本</span><select id="wb-realm">' +
+        '<option value="cn">国内版 · codebuddy.cn（支持每日签到）</option>' +
+        '<option value="global">国际版 · workbuddy.ai（无签到体系）</option>' +
+      '</select></label>' +
+      '<div id="wb-qr" class="qr-box"><span class="muted">选择版本后点「生成二维码」</span></div>' +
+      '<p id="wb-status" class="wb-status">等待生成二维码</p>' +
+      '<p class="wb-hint">微信 / QQ 扫码，或打开授权页用手机号 + 验证码登录（授权页支持切回扫码）。' +
+        '授权成功后自动纳管账号、同步模型并立即签到一次。</p>' +
+      '<a id="wb-link" class="wb-link hidden" href="#" target="_blank" rel="noopener">在浏览器打开授权页 ↗</a>' +
+    '</div>',
+    '<button class="btn" data-action="modal-close">取消</button>' +
+    '<button class="btn ghost" data-action="wb-copy-link">复制链接</button>' +
+    '<button class="btn primary" data-action="wb-start">生成二维码</button>', true);
+}
+async function startWbLogin() {
+  clearWbPoll();
+  state.wb = null;
+  state.wbErrors = 0;
+  const realm = (document.getElementById('wb-realm') || {}).value || 'cn';
+  setWbStatus('正在申请腾讯授权链接…');
+  try {
+    const r = await api('/wb/auth/start', { method: 'POST', body: JSON.stringify({ realm }) });
+    state.wb = { state: r.state, realm: r.realm || realm, ttl: r.ttl || 900,
+                 authUrl: r.auth_url || '', started: Date.now() / 1000 };
+    const qr = document.getElementById('wb-qr');
+    qr.innerHTML = r.qr
+      ? '<img src="' + esc(r.qr) + '" alt="WorkBuddy 登录二维码">'
+      : '<span class="muted">二维码生成失败，请用下方链接在浏览器打开授权页</span>';
+    const link = document.getElementById('wb-link');
+    if (state.wb.authUrl) { link.href = state.wb.authUrl; link.classList.remove('hidden'); }
+    else { link.classList.add('hidden'); }
+    setWbStatus(r.hint || '请用微信 / QQ 扫码授权');
+    startWbPoll();
+  } catch (err) {
+    setWbStatus(err.message, 'err');
+  }
+}
+function startWbPoll() {
+  clearWbPoll();
+  state.wbPoll = setInterval(pollWbOnce, 2000);
+  pollWbOnce();
+}
+async function pollWbOnce() {
+  const w = state.wb;
+  if (!w || !w.state || !state.wbPoll) return;
+  const left = Math.max(0, Math.round(w.started + w.ttl - Date.now() / 1000));
+  try {
+    const r = await api('/wb/auth/poll?state=' + encodeURIComponent(w.state) +
+                        '&realm=' + encodeURIComponent(w.realm));
+    state.wbErrors = 0;
+    if (r.status === 'waiting') {
+      setWbStatus('等待扫码授权…（二维码剩余 ' + left + ' 秒）');
+      return;
+    }
+    if (r.status === 'ready') {
+      clearWbPoll();
+      setWbStatus('授权成功：' + (r.nickname || r.uid) + '，正在保存并签到…');
+      const f = await api('/wb/auth/finish', {
+        method: 'POST', body: JSON.stringify({ state: w.state, auto_checkin: true }),
+      });
+      const c = f.checkin;
+      state.wb = null;
+      closeModal();
+      toast(f.message + (c ? (c.ok ? '，签到成功' : '，签到：' + (c.message || '未完成')) : ''),
+            c && !c.ok ? 'warn' : 'ok');
+      await navigate('accounts');
+      return;
+    }
+    if (r.status === 'expired' || r.status === 'invalid') {
+      clearWbPoll(); setWbStatus('二维码已失效，请点「生成二维码」重新获取', 'err'); return;
+    }
+    if (r.status === 'realm_mismatch') {
+      clearWbPoll(); setWbStatus('账号版本不一致，请重新生成二维码', 'err'); return;
+    }
+  } catch (err) {
+    state.wbErrors += 1;
+    setWbStatus('轮询失败：' + err.message, 'err');
+    if (state.wbErrors >= 5) {
+      clearWbPoll();
+      setWbStatus('连续失败已停止轮询，请重新生成二维码', 'err');
+    }
+  }
 }
 
 document.getElementById('login-form').addEventListener('submit', async e => {
@@ -240,7 +343,11 @@ function accountForm(a) {
   const methods = ['POST', 'GET', 'PUT', 'PATCH'];
   const methodOptions = methods.map(m =>
     '<option value="' + m + '"' + ((a && a.checkin_method === m) || (!a && m === 'POST') ? ' selected' : '') + '>' + m + '</option>').join('');
-  return '<form id="modal-form">' +
+  const wbNote = (a && a.source === 'workbuddy')
+    ? '<div class="note">该账号由 WorkBuddy 扫码登录纳管：Token 与刷新令牌自动维护，签到走腾讯官方接口。' +
+      '这里只改分组、权重、模型等展示字段；换凭据请用「刷新授权」或重新扫码。</div>'
+    : '';
+  return wbNote + '<form id="modal-form">' +
     '<div class="form-grid">' +
       '<label class="field"><span>账号名称 *</span><input name="name" value="' + esc(a ? a.name : '') + '" required></label>' +
       '<label class="field"><span>分组</span><input name="group_name" value="' + esc(a ? a.group_name : 'default') + '"></label>' +
@@ -275,7 +382,7 @@ function openModal(title, body, footer, narrow) {
     '<div class="modal-body">' + body + '</div>' +
     '<div class="modal-foot">' + footer + '</div></div></div>';
 }
-function closeModal() { modalRoot.innerHTML = ''; }
+function closeModal() { clearWbPoll(); modalRoot.innerHTML = ''; }
 function formObject(scope) {
   const obj = {};
   scope.querySelectorAll('[name]').forEach(el => {
@@ -290,8 +397,12 @@ async function renderAccounts() {
   const rows = items.map(a => {
     const models = (a.models || []).slice(0, 3).map(m => '<span class="tag">' + esc(m) + '</span>').join('') ||
                    '<span class="muted">不限</span>';
+    const sourceTag = a.source === 'workbuddy'
+      ? '<span class="tag wb">WorkBuddy ' + esc(a.realm === 'global' ? '国际版' : '国内版') + '</span>'
+      : '<span class="tag">手工录入</span>';
     return '<tr>' +
-      '<td><strong>' + esc(a.name) + '</strong><span class="sub">' + esc(a.group_name || 'default') + '</span></td>' +
+      '<td><strong>' + esc(a.name) + '</strong><span class="sub">' + esc(a.group_name || 'default') +
+        ' ' + sourceTag + '</span></td>' +
       '<td><span class="ellipsis mono" title="' + esc(a.base_url) + '">' + esc(a.base_url) + '</span>' +
         '<span class="sub mono">' + esc(a.api_key_masked) + '</span></td>' +
       '<td>' + badge(a.effective_status) + '</td>' +
@@ -303,7 +414,10 @@ async function renderAccounts() {
       '<td><div class="row-actions">' +
         '<button class="btn ghost sm" data-action="account-edit" data-id="' + a.id + '">编辑</button>' +
         '<button class="btn ghost sm" data-action="account-probe" data-id="' + a.id + '">探测</button>' +
-        '<button class="btn ghost sm" data-action="account-checkin" data-id="' + a.id + '">签到</button>' +
+        (a.source === 'workbuddy'
+          ? '<button class="btn ghost sm" data-action="wb-refresh" data-id="' + a.id + '">刷新授权</button>' : '') +
+        (a.checkin_supported !== false
+          ? '<button class="btn ghost sm" data-action="account-checkin" data-id="' + a.id + '">签到</button>' : '') +
         '<button class="btn ghost sm" data-action="account-toggle" data-id="' + a.id + '" data-enabled="' + a.enabled + '">' +
           (a.enabled ? '停用' : '启用') + '</button>' +
         '<button class="btn ghost sm danger" data-action="account-del" data-id="' + a.id + '">删除</button>' +
@@ -311,7 +425,8 @@ async function renderAccounts() {
   }).join('');
   pageEl.innerHTML =
     '<div class="toolbar">' +
-      '<button class="btn primary" data-action="account-new">新增账号</button>' +
+      '<button class="btn primary" data-action="wb-login">扫码登录 WorkBuddy</button>' +
+      '<button class="btn" data-action="account-new">手工新增账号</button>' +
       '<button class="btn" data-action="checkin-all">全部签到</button>' +
       '<button class="btn" data-action="reload">刷新</button>' +
       '<span class="spacer"></span><span class="muted">共 ' + items.length + ' 个账号</span>' +
@@ -321,7 +436,7 @@ async function renderAccounts() {
         '<th>账号 / 分组</th><th>上游地址</th><th>状态</th><th>模型</th><th>权重</th>' +
         '<th>积分</th><th>今日调用</th><th>上次签到</th><th>操作</th></tr></thead><tbody>' +
         rows + '</tbody></table></div>'
-      : '<div class="card">' + empty('还没有账号', '点击「新增账号」录入一组上游 API 凭据，之后即可签发密钥对外提供反代') + '</div>');
+      : '<div class="card">' + empty('还没有账号', '点「扫码登录 WorkBuddy」直接在页面授权并自动签到；也可以手工录入一组 OpenAI 兼容凭据') + '</div>');
 }
 
 /* ── 密钥分发 ─────────────────────────────────────── */
@@ -417,7 +532,8 @@ async function renderCheckins() {
       '<td>' + esc(r.account_name || '-') + '</td>' +
       '<td><span class="badge ' + (r.ok ? 'ok' : 'fail') + '">' + (r.ok ? '成功' : '失败') + '</span></td>' +
       '<td class="mono">' + esc(r.status_code || '-') + '</td>' +
-      '<td>' + esc(r.trigger === 'auto' ? '自动' : '手动') + '</td>' +
+      '<td>' + esc(r.trigger === 'auto' ? '自动' : r.trigger === 'skip' ? '跳过'
+                   : r.trigger === 'login' ? '登录后' : '手动') + '</td>' +
       '<td class="ellipsis" title="' + esc(r.message) + '">' + esc(r.message || '-') + '</td>' +
     '</tr>').join('');
   pageEl.innerHTML =
@@ -425,7 +541,7 @@ async function renderCheckins() {
       '<span class="spacer"></span><span class="muted">最近 ' + items.length + ' 条</span></div>' +
     (items.length
       ? '<div class="card table-wrap"><table><thead><tr>' +
-        '<th>时间</th><th>账号</th><th>结果</th><th>HTTP</th><th>触发方式</th><th>说明</th>' +
+        '<th>时间</th><th>账号</th><th>结果</th><th>业务码</th><th>触发方式</th><th>说明</th>' +
         '</tr></thead><tbody>' + rows + '</tbody></table></div>'
       : '<div class="card">' + empty('暂无签到记录', '给账号配置签到地址后，可在账号页手动签到或等待每日自动签到') + '</div>');
 }
@@ -434,7 +550,11 @@ async function renderCheckins() {
 async function renderSettings() {
   const d = await api('/settings');
   const s = d.items || {};
+  const w = d.workbuddy || {};
+  const v = w.versions || {};
   const num = (key, fallback) => esc(s[key] === undefined ? fallback : s[key]);
+  const fullVer = (short, full) => esc(short || '-') +
+    (full && full !== short ? ' <span class="muted">(' + esc(full) + ')</span>' : '');
   pageEl.innerHTML =
     '<div class="grid-2">' +
       '<section class="card"><h3>调度与反代参数</h3><form id="settings-form">' +
@@ -465,6 +585,37 @@ async function renderSettings() {
           '<dt>出站代理</dt><dd class="mono">' + esc(d.http_proxy || '直连') + '</dd>' +
           '<dt>会话有效期</dt><dd class="mono">' + nfmt(d.session_timeout) + ' 秒</dd>' +
         '</dl></section>' +
+        '<section class="card"><h3>WorkBuddy 真实签到</h3><dl class="info-grid">' +
+          '<dt>登录端点</dt><dd class="mono">' + esc(w.cn_chat_base || '-') + '</dd>' +
+          '<dt>签到端点</dt><dd class="mono">' + esc(w.cn_billing_base || '-') + '/v2/billing/meter/daily-checkin</dd>' +
+          '<dt>国际版</dt><dd class="mono">' + esc(w.global_base || '-') + '（无签到体系）</dd>' +
+          '<dt>二维码有效期</dt><dd class="mono">' + nfmt(w.state_ttl) + ' 秒</dd>' +
+          '<dt>登录后自动签到</dt><dd>' + (w.auto_checkin_on_login ? '开启' : '关闭') + '</dd>' +
+        '</dl><p class="muted" style="font-size:12px;margin:12px 0 0">' +
+          '在「账号管理 → 扫码登录 WorkBuddy」直接授权；签到按腾讯 code=0 / 10001（今日已签到）口径记账，' +
+          '10001「稍后重试」不会被误记成成功。</p></section>' +
+        '<section class="card"><h3>官方客户端版本 <span class="tag">' +
+          esc(v.source_text || '内置默认') + '</span></h3>' +
+          '<div class="version-bar"><span class="muted">' +
+            (v.mode === 'pinned' ? '部分版本已手动锁定' :
+              '自动跟随官方发布 · 每 ' + nfmt(v.refresh_hours || 6) + ' 小时同步') + '</span>' +
+            '<button class="btn ghost sm" data-action="wb-versions-refresh">立即同步</button></div>' +
+          '<dl class="info-grid">' +
+            '<dt>国内版客户端</dt><dd class="mono">' + fullVer(v.client_cn, v.full_cn) + '</dd>' +
+            '<dt>国际版客户端</dt><dd class="mono">' + fullVer(v.client_global, v.full_global) + '</dd>' +
+            '<dt>CLI 版本</dt><dd class="mono">' + esc(v.cli || '-') + '</dd>' +
+            '<dt>上次同步</dt><dd class="mono">' + esc(v.fetched_at_text || '从未') + '</dd>' +
+            '<dt>客户端来源</dt><dd class="mono" style="font-size:12px">' +
+              esc(w.cn_billing_base || '-') + esc(v.client_update_path || '') + '</dd>' +
+            '<dt>CLI 来源</dt><dd class="mono" style="font-size:12px">' +
+              esc(v.cli_registry || '-') + '</dd>' +
+          '</dl>' +
+          (v.last_error ? '<p class="form-error" style="margin:12px 0 0">部分源未取到版本，' +
+            '已沿用上次成功值：' + esc(v.last_error) + '</p>' : '') +
+          '<p class="muted" style="font-size:12px;margin:12px 0 0">' +
+            '版本不写在 config.yml 里：客户端取官网 /v2/update，CLI 取 npm @tencent-ai/codebuddy-code 的 latest。' +
+            '官方升级后自动跟随，无需改配置或重新打包；探测失败沿用上次成功值，不影响签到。' +
+            '排查问题时可用 BW_WB_CLIENT_VERSION / BW_WB_CLI_VERSION 临时钉死。</p></section>' +
         '<section class="card"><h3>反代接入</h3>' +
           '<pre class="code-block">from openai import OpenAI\n\nclient = OpenAI(\n    base_url="http://&lt;服务器&gt;:3002/v1",\n    api_key="bw-xxxxxxxxxxxxxxxx",\n)\nresp = client.chat.completions.create(\n    model="你的别名或实际模型名",\n    messages=[{"role": "user", "content": "hi"}],\n)</pre>' +
           '<p class="muted" style="font-size:12px;margin:12px 0 0">管理端口只监听 127.0.0.1，公网访问请在 Nginx / Caddy 上做 HTTPS 反代与访问控制。</p>' +
@@ -485,6 +636,33 @@ document.addEventListener('click', async e => {
     switch (action) {
       case 'modal-close': closeModal(); break;
       case 'reload': await navigate(state.page); break;
+
+      /* 账号：WorkBuddy 页面扫码登录 */
+      case 'wb-login':
+        clearWbPoll(); state.wb = null; wbLoginModal(); break;
+      case 'wb-start':
+        await startWbLogin(); break;
+      case 'wb-copy-link': {
+        const href = (document.getElementById('wb-link') || {}).href || '';
+        if (!href || href.slice(-1) === '#') { toast('请先生成二维码', 'warn'); break; }
+        try { await navigator.clipboard.writeText(href); toast('授权链接已复制'); }
+        catch (_) { toast('复制失败，请手动复制链接', 'warn'); }
+        break;
+      }
+      case 'wb-refresh': {
+        toast('正在刷新授权与实时积分…');
+        const r = await api('/wb/accounts/' + id + '/refresh', { method: 'POST' });
+        toast(r.message || (r.ok ? '刷新成功' : '刷新失败'), r.ok ? 'ok' : 'err');
+        await navigate('accounts');
+        break;
+      }
+      case 'wb-versions-refresh': {
+        toast('正在向官方发布源同步版本…');
+        const r = await api('/wb/versions/refresh', { method: 'POST' });
+        toast(r.ok ? '版本已同步' : '同步未完成，已沿用上次成功值', r.ok ? 'ok' : 'warn');
+        await navigate('settings');
+        break;
+      }
 
       /* 账号 */
       case 'account-new':
